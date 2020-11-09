@@ -34,6 +34,7 @@ import (
 	"github.com/containernetworking/cni/pkg/invoke"
 	"github.com/containernetworking/cni/pkg/skel"
 	cnitypes "github.com/containernetworking/cni/pkg/types"
+	"github.com/containernetworking/cni/pkg/types/current"
 	cniversion "github.com/containernetworking/cni/pkg/version"
 	"github.com/containernetworking/plugins/pkg/ns"
 	k8s "github.com/intel/multus-cni/k8sclient"
@@ -429,6 +430,107 @@ func delPlugins(exec invoke.Exec, argIfname string, delegates []*types.DelegateN
 	return nil
 }
 
+// Merge code based on CNI-Genie's code
+// https://github.com/Huawei-PaaS/CNI-Genie/blob/master/genie/genie-controller.go#L882
+func mergeWithResult(srcObj, dstObj cnitypes.Result) (cnitypes.Result, error) {
+	srcObj, err := updateRoutes(srcObj)
+	if err != nil {
+		return nil, logging.Errorf("Routes update failed: %v", err)
+	}
+
+	srcObj, err = fixInterfaces(srcObj)
+	if err != nil {
+		return nil, logging.Errorf("Failed to fix interfaces: %v", err)
+	}
+
+	if dstObj == nil {
+		return srcObj, nil
+	}
+	src, err := current.NewResultFromResult(srcObj)
+	if err != nil {
+		return nil, logging.Errorf("Couldn't convert old result to current version: %v", err)
+	}
+	dst, err := current.NewResultFromResult(dstObj)
+	if err != nil {
+		return nil, logging.Errorf("Couldn't convert old result to current version: %v", err)
+	}
+
+	ifacesLength := len(dst.Interfaces)
+
+	for _, iface := range src.Interfaces {
+		dst.Interfaces = append(dst.Interfaces, iface)
+	}
+	for _, ip := range src.IPs {
+		if ip.Interface != nil && *(ip.Interface) != -1 {
+			ip.Interface = current.Int(*(ip.Interface) + ifacesLength)
+		}
+		dst.IPs = append(dst.IPs, ip)
+	}
+	for _, route := range src.Routes {
+		dst.Routes = append(dst.Routes, route)
+	}
+
+	for _, ns := range src.DNS.Nameservers {
+		dst.DNS.Nameservers = append(dst.DNS.Nameservers, ns)
+	}
+	for _, s := range src.DNS.Search {
+		dst.DNS.Search = append(dst.DNS.Search, s)
+	}
+	for _, opt := range src.DNS.Options {
+		dst.DNS.Options = append(dst.DNS.Options, opt)
+	}
+	// TODO: what about DNS.domain?
+	return dst, nil
+}
+
+// updateRoutes changes nil gateway set in a route to a gateway from IPConfig
+// nil gw in route means default gw from result. When merging results from
+// many results default gw may be set from another CNI network. This may lead to
+// wrong routes.
+func updateRoutes(rObj cnitypes.Result) (cnitypes.Result, error) {
+	result, err := current.NewResultFromResult(rObj)
+	if err != nil {
+		return nil, logging.Errorf("Couldn't convert old result to current version: %v", err)
+	}
+	if len(result.Routes) == 0 {
+		return result, nil
+	}
+
+	var gw net.IP
+	for _, ip := range result.IPs {
+		if ip.Gateway != nil {
+			gw = ip.Gateway
+			break
+		}
+	}
+
+	for _, route := range result.Routes {
+		if route.GW == nil {
+			if gw == nil {
+				return nil, logging.Errorf("Couldn't find gw in result %v", result)
+			}
+			route.GW = gw
+		}
+	}
+	return result, nil
+}
+
+// fixInterfaces fixes bad result returned by CNI plugin
+// some plugins(for example calico) return empty Interfaces list but
+// in IPConfig sets Interface index to 0. In such case it should be nil
+func fixInterfaces(rObj cnitypes.Result) (cnitypes.Result, error) {
+	result, err := current.NewResultFromResult(rObj)
+	if err != nil {
+		return nil, logging.Errorf("Couldn't convert old result to current version: %v", err)
+	}
+	if len(result.Interfaces) == 0 {
+		for _, ip := range result.IPs {
+			ip.Interface = nil
+		}
+	}
+	return result, nil
+}
+
 func cmdErr(k8sArgs *types.K8sArgs, format string, args ...interface{}) error {
 	prefix := "Multus: "
 	if k8sArgs != nil {
@@ -527,10 +629,10 @@ func cmdAdd(args *skel.CmdArgs, exec invoke.Exec, kubeClient *k8s.ClientInfo) (c
 				return nil, cmdErr(k8sArgs, "error setting default gateway: %v", err)
 			}
 		}
-
-		// Master plugin result is always used if present
-		if delegate.MasterPlugin || result == nil {
-			result = tmpResult
+		// Merge results from delegates
+		result, err = mergeWithResult(tmpResult, result)
+		if err != nil {
+			return nil, logging.Errorf("Multus: Failed to merge results: %v", err)
 		}
 
 		//create the network status, only in case Multus as kubeconfig
